@@ -34,7 +34,7 @@ public actor SessionPipeline {
     private var closedOutages: [TargetOutage] = []
     private var lastSeenByTarget: [Int: Int64] = [:]
     private var openRunStart: [Int: Int64] = [:]                    // 대상별 열린 손실 run의 첫 손실 송신 시각
-    private var latestProbeMono: Int64 = 0
+    private var latestScheduledMono: Int64 = 0                      // stale 판정 기준: 예정 송신 시각의 최댓값
     private var finished = false
     private var okCounts: [Int: Int] = [:]
     private var latestMono: Int64 = 0
@@ -76,7 +76,8 @@ public actor SessionPipeline {
         guard !finished else { return }
         ring.append(r)
         lastSeenByTarget[r.targetId] = max(lastSeenByTarget[r.targetId] ?? .min, r.tSendMono)
-        latestProbeMono = max(latestProbeMono, r.tSendMono)
+        // 지연된 버스트는 stale 기준을 앞당기지 못합니다. 실제 송신이 아니라 예정 송신 시각으로 잽니다.
+        latestScheduledMono = max(latestScheduledMono, r.tSendMono - r.sendDelayUs * 1000)
         if r.status == .ok { okCounts[r.targetId, default: 0] += 1 }
         // 늦게 온 순번 역순 프로브(이미 닫힌 run 뒤의 ok)는 검출기에서 아무 일도 하지 않습니다.
         if detectors[r.targetId] != nil {
@@ -176,9 +177,9 @@ public actor SessionPipeline {
         activeTargetIds.remove(id)
     }
 
-    /// 판정 기준 시각에 쓰는 대상: 은퇴하지 않았고, 최근 프로브보다 3초 넘게 뒤처지지 않은 대상.
+    /// 판정 기준 시각에 쓰는 대상: 은퇴하지 않았고, 가장 늦은 예정 송신보다 3초 넘게 뒤처지지 않은 대상.
     private func liveTargetIds() -> [Int] {
-        let staleBefore = latestProbeMono - Self.staleNs
+        let staleBefore = latestScheduledMono - Self.staleNs
         return activeTargetIds.filter { (lastSeenByTarget[$0] ?? .min) >= staleBefore }
     }
 

@@ -208,6 +208,37 @@ import Testing
         guard case .verdict(let v) = out.first?.outcome else { Issue.record("no verdict"); return }
         #expect(v.evidence.contains("\"lost_count\":13800,\"probe_count\":13801"))
     }
+    /// 호스트 정지(T~T+4초) 중 예정됐던 프로브가 정지 뒤 몰아 도착하는 흐름. 닫는 ok가 실제 송신 T+4초면
+    /// 실제 송신 시각 기준으로는 다른 대상이 전부 stale로 보여 사건이 창 프로브 없이 일찍 판정된다.
+    /// stale 판정은 예정 송신 시각을 기준으로 해야 한다.
+    @Test func staleCheckUsesScheduledTimeNotActualSend() async throws {
+        let r = try await rig(); defer { try? FileManager.default.removeItem(atPath: r.path) }
+        let stallUs: Int64 = 4_000_000                     // 와이파이 gw 닫는 ok의 4초 정지
+        let burstUs: Int64 = 100_000                       // 대조군 프로브의 버스트 밀림(0.1초)
+        let wgAll = SyntheticSession.probes(target: r.wg, startNs: 0, count: 600, lostSeqs: Set(400..<408), delayedSeqs: [408: stallUs])
+        let wiAll = SyntheticSession.probes(target: r.wi, startNs: 0, count: 150, lostSeqs: [],
+                                            delayedSeqs: Dictionary(uniqueKeysWithValues: (98..<150).map { ($0, burstUs) }))
+        let egAll = SyntheticSession.probes(target: r.eg, startNs: 0, count: 600, lostSeqs: [],
+                                            delayedSeqs: Dictionary(uniqueKeysWithValues: (390..<600).map { ($0, burstUs) }))
+        let eiAll = SyntheticSession.probes(target: r.ei, startNs: 0, count: 150, lostSeqs: [],
+                                            delayedSeqs: Dictionary(uniqueKeysWithValues: (98..<150).map { ($0, burstUs) }))
+        func scheduled(_ p: ProbeResult) -> Int64 { p.tSendMono - p.sendDelayUs * 1000 }
+        // 1) 정지 전까지. 예정 19.5초 이후의 대조군 프로브는 아직 못 온다(창 확장 0.2초 밖).
+        var order = [wgAll, wiAll, egAll, eiAll].flatMap { $0.filter { $0.sendDelayUs == 0 && scheduled($0) < 20 * S } }
+        // 2) 와이파이 gw 손실 run(20.0~20.35초). 닫는 ok는 4초 밀려 실제 송신 24.4초.
+        order += wgAll.filter { (400..<409).contains($0.seq) }
+        // 3) 창 안 대조군 프로브(예정 19.5~21초, 실제 +0.1초)는 닫는 ok보다 늦게 도착.
+        order += [wiAll, egAll, eiAll].flatMap { $0.filter { $0.sendDelayUs > 0 && scheduled($0) <= 21 * S } }
+        // 4) 나머지로 창을 충분히 지나게 함.
+        order += wgAll.filter { $0.seq >= 409 }
+        order += [wiAll, egAll, eiAll].flatMap { $0.filter { scheduled($0) > 21 * S } }
+        for p in order { await r.pipeline.ingest(p) }
+        let out = try await r.pipeline.finish()
+        #expect(out.count == 1)
+        guard case .verdict(let v) = out.first?.outcome else { Issue.record("no verdict"); return }
+        #expect(v.segment == .wireless)          // 일찍 판정하면 대조군 없음(HOST_STALL/UNDETERMINED)으로 그르침
+        #expect(v.reasonCode == nil)
+    }
     @Test func finishIsIdempotentAndStopsIngest() async throws {
         let r = try await rig(); defer { try? FileManager.default.removeItem(atPath: r.path) }
         await feed(r, [SyntheticSession.probes(target: r.wg, startNs: 0, count: 600, lostSeqs: Set(580..<600)),
