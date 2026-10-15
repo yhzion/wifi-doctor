@@ -33,6 +33,10 @@ public enum EventGrouper {
                 near($0.startMono, $0.endMono, out.startMono, out.endMono)
             }) {
                 events[i].outages.append(out)
+            } else if let last = events.indices.last, last >= wifiEventCount,
+                      near(events[last].startMono, events[last].endMono, out.startMono, out.endMono) {
+                events[last].endMono = max(events[last].endMono, out.endMono)
+                events[last].outages.append(out)
             } else {
                 events.append(OutageEvent(id: 0, startMono: out.startMono, endMono: out.endMono,
                                           suppressed: false, wiredOnly: true, outages: [out]))
