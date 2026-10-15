@@ -35,4 +35,31 @@ import Foundation
         var m = try await model(); m.meta.notes = "<b>x</b>"
         #expect(ReportRenderer.render(m).contains("&lt;b&gt;x&lt;/b&gt;"))
     }
+
+    @Test func selfExplainingAndHonest() async throws {
+        var m = try await model()
+        let S: Int64 = 1_000_000_000
+        func smp(_ t: Int64, _ r: Int?) -> WirelessSample {
+            WirelessSample(tMono: t, state: .associated, rssiDbm: r, noiseDbm: nil, txRateMbps: nil,
+                           channel: nil, band: nil, widthMhz: nil, bssid: nil, ssid: nil)
+        }
+        let ev = m.countedEvents[0]
+        m.representative = [RepresentativeEvent(event: ev, verdict: nil, probes: [],
+            samples: [smp(ev.startMono, -60), smp(ev.startMono + S / 5, -62), smp(ev.startMono + 2 * S / 5, nil),
+                      smp(ev.startMono + 3 * S / 5, -70), smp(ev.startMono + 4 * S / 5, -71)])]
+        m.topology = .noMerge
+        m.segmentCounts[.sharedAccess] = 1; m.sharedAccessRepeatCount = 1
+        m.verdictsByEvent[ev.id] = VerdictResult(eventId: ev.id, segment: .sharedAccess, wirelessCause: nil,
+            confidence: .low, reasonCode: nil, reason: "r", evidence: "{\"host_delay_partial\":true,\"x\":\"<i>\"}")
+        let html = ReportRenderer.render(m)
+        #expect(html.components(separatedBy: "<polyline").count - 1 >= 2)
+        let para = html.components(separatedBy: "SHARED_ACCESS: ").last?.components(separatedBy: "</p>").first ?? ""
+        #expect(para.contains("알 수 없습니다")); #expect(para.contains("합류 홉") == false)
+        for id in ["WIRELESS_UPSTREAM", "SHARED_FIRST_HOP", "SHARED_UPSTREAM", "INTERNET_PARTIAL", "WIRED_ONLY", "HOST_STALL", "UNDETERMINED"] {
+            #expect(html.contains("<td>\(id)</td>"))
+        }
+        #expect(html.contains("측정 중단"))
+        #expect(html.contains("&lt;i&gt;"))
+        #expect(html.contains("host_delay_partial"))
+    }
 }
