@@ -34,6 +34,7 @@ public struct ReportModel: Sendable, Codable, Equatable {
     public var sharedAccessRepeatCount: Int
     public var hostStallEvents: [OutageEvent]
     public var suppressedEvents: [OutageEvent]
+    public var anchors: [ClockAnchor]
     public var sleepIntervals: [Interval]                   // 단조 시각(ns)
     public var anchorJumps: [ClockAnchor.Jump]
     public var awdl0History: [SystemEvent]
@@ -46,6 +47,16 @@ public struct ReportModel: Sendable, Codable, Equatable {
     public var sessionSha256: String
     public var locationLimitation: String?
     public var abnormalEnd: Bool
+
+    /// 단조 시각(ns) → 벽시계 ms. 앵커가 있으면 앵커 기준, 없으면 세션 시작 기준.
+    public func wallMs(forMono t: Int64) -> Int64 {
+        Self.wallMs(forMono: t, anchors: anchors, meta: meta)
+    }
+
+    static func wallMs(forMono t: Int64, anchors: [ClockAnchor], meta: SessionMeta) -> Int64 {
+        anchors.isEmpty ? meta.startedWallMs + (t - meta.startedMonoNs) / 1_000_000
+                        : ClockAnchor.wallMs(forMono: t, anchors: anchors)
+    }
 }
 
 public struct RepresentativeEvent: Sendable, Codable, Equatable {

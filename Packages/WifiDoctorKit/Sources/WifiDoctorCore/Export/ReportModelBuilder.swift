@@ -17,8 +17,7 @@ public enum ReportModelBuilder {
         let probeStats = try reader.probeStats()
 
         func wallMs(_ mono: Int64) -> Int64 {
-            anchors.isEmpty ? meta.startedWallMs + (mono - meta.startedMonoNs) / 1_000_000
-                            : ClockAnchor.wallMs(forMono: mono, anchors: anchors)
+            ReportModel.wallMs(forMono: mono, anchors: anchors, meta: meta)
         }
 
         var endMono = meta.endedMonoNs
@@ -40,7 +39,7 @@ public enum ReportModelBuilder {
             histogram[e.bucket, default: 0] += 1
             if e.durationMs >= 1000 {
                 let w = wallMs(e.startMono)
-                perHour[Int64((Double(w) / Double(hourMs)).rounded(.down)) * hourMs, default: 0] += 1
+                perHour[w / hourMs * hourMs, default: 0] += 1
             }
             if let v = verdicts[e.id] { segmentCounts[v.segment, default: 0] += 1 }
         }
@@ -98,7 +97,7 @@ public enum ReportModelBuilder {
             longestEvent: longest, topology: topology, hops: hops, topologyCaveat: caveat(topology),
             sharedAccessRepeatCount: segmentCounts[.sharedAccess] ?? 0,
             hostStallEvents: hostStallEvents, suppressedEvents: suppressedEvents,
-            sleepIntervals: sleeps,
+            anchors: anchors, sleepIntervals: sleeps,
             anchorJumps: ClockAnchor.jumps(anchors: anchors, thresholdMs: anchorJumpThresholdMs),
             awdl0History: systemEvents.filter { $0.kind == .awdl0State },
             scanCacheUpdateCount: try reader.linkEvents().filter { $0.kind == .scanCacheUpdated }.count,
