@@ -60,9 +60,10 @@ public enum CSVExporter {
         infos.append(try hop.close())
 
         let outage = try CSVFile(dir: dir, name: "outage.csv",
-                                 header: "target_id,start_mono,t_wall_ms,end_mono,lost_count,first_seq,last_seq,closed_at_end")
-        for o in try reader.outages() {
-            try outage.row([num(o.targetId), num(o.startMono), wall(o.startMono), num(o.endMono), num(o.lostCount),
+                                 header: "id,event_id,target_id,start_mono,t_wall_ms,end_mono,lost_count,first_seq,last_seq,closed_at_end")
+        for r in try reader.outageRows() {
+            let o = r.outage
+            try outage.row([num(r.id), num(r.eventId), num(o.targetId), num(o.startMono), wall(o.startMono), num(o.endMono), num(o.lostCount),
                             num(o.firstSeq), num(o.lastSeq), o.closedAtEnd ? "1" : "0"])
         }
         infos.append(try outage.close())

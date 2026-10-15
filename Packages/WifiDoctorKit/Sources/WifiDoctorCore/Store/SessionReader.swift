@@ -197,6 +197,14 @@ public final class SessionReader: @unchecked Sendable {
             """) { s in Self.outage(s) }
     }
 
+    /// CSV 내보내기용. 끊김 행의 `id`와 `event_id`(없으면 nil)를 함께 돌려줍니다.
+    public func outageRows() throws -> [(id: Int64, eventId: Int64?, outage: TargetOutage)] {
+        try query("""
+            SELECT id, target_id, start_mono, end_mono, lost_count, first_seq, last_seq, closed_at_end, event_id
+            FROM outage ORDER BY id
+            """) { s in (id: s.int64(0)!, eventId: s.int64(8), outage: Self.outage(shifted: s)) }
+    }
+
     private static func outage(_ s: SQLiteStatement) -> TargetOutage {
         TargetOutage(targetId: Int(s.int64(0)!), startMono: s.int64(1)!, endMono: s.int64(2)!,
                      lostCount: Int(s.int64(3)!), firstSeq: s.int64(4)!, lastSeq: s.int64(5)!, closedAtEnd: s.int64(6)! != 0)
