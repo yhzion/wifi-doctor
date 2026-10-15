@@ -1,0 +1,16 @@
+# 측정 산출물
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+sessions/
+reports/
+*.csv
+docs/verification/**/*.html
+
+# Xcode / SwiftPM
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
