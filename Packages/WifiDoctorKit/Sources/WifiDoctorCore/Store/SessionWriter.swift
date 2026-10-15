@@ -57,6 +57,14 @@ public actor SessionWriter {
     public func enqueue(_ e: SystemEvent) { systemEvents.append(e) }
     public func enqueue(_ a: ClockAnchor) { anchors.append(a) }
 
+    /// flush가 끝내 실패했을 때 호출자가 독이 된 배치를 버립니다. 버린 행 수를 돌려줍니다.
+    public func discardPending() -> Int {
+        let count = pendingCount
+        probes.removeAll(); samples.removeAll(); linkEvents.removeAll()
+        systemEvents.removeAll(); anchors.removeAll()
+        return count
+    }
+
     /// 큐 5개를 한 트랜잭션으로 씁니다. 쓴 행 수를 돌려줍니다.
     /// 실패하면 ROLLBACK 하고 큐를 유지한 채 총 3회까지 시도합니다. `SQLITE_FULL`은 재시도 없이 `diskFull`.
     public func flush() throws -> Int {

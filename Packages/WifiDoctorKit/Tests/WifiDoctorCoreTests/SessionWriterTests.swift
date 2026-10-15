@@ -49,4 +49,23 @@ import Testing
         try await w.updateEventSuppressed(id: 3, suppressed: true)
         #expect(try SessionStore.openReader(path: path).events()[0].suppressed)
     }
+    @Test func failedFlushKeepsQueueAndDiscardAllowsRecovery() async throws {
+        let path = tempDBPath(); defer { try? FileManager.default.removeItem(atPath: path) }
+        let w = try SessionStore.create(path: path, meta: sampleMeta())
+        var gw = SyntheticSession.target(id: 0, path: .wifi, role: .gateway); gw.id = try await w.insertTarget(gw)
+        let ps = SyntheticSession.probes(target: gw, startNs: 0, count: 2, lostSeqs: [])
+        await w.enqueue(ps[0])
+        _ = try await w.flush()
+        await w.enqueue(ps[1]); await w.enqueue(ps[0])
+        await #expect(throws: (any Error).self) { try await w.flush() }
+        #expect(await w.pendingCount == 2)
+        let r = try SessionStore.openReader(path: path)
+        #expect(try r.rowCount(table: "probe") == 1)
+        #expect(await w.discardPending() == 2)
+        #expect(await w.pendingCount == 0)
+        let se = SystemEvent(tMono: 1, kind: .probeError, detail: "flush_failed")
+        await w.enqueue(se)
+        #expect(try await w.flush() == 1)
+        #expect(try r.systemEvents() == [se])
+    }
 }
