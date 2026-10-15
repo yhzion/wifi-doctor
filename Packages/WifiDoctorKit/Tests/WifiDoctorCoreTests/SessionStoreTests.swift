@@ -20,13 +20,14 @@ func sampleMeta() -> SessionMeta {
         #expect(try r.pragmaUserVersion() == 1)
         #expect(try r.pragmaJournalMode() == "wal")
     }
-    @Test func targetsAndProbesRoundTrip() throws {
+    @Test func targetsAndProbesRoundTrip() async throws {
         let path = tempDBPath(); defer { try? FileManager.default.removeItem(atPath: path) }
         let w = try SessionStore.create(path: path, meta: sampleMeta())
         var gw = SyntheticSession.target(id: 0, path: .wifi, role: .gateway)
-        gw.id = try w.insertTarget(gw)
+        gw.id = try await w.insertTarget(gw)
         let probes = SyntheticSession.probes(target: gw, startNs: 0, count: 100, lostSeqs: [10, 11], lateSeqs: [12])
-        try w.write(probes: probes)
+        for p in probes { await w.enqueue(p) }
+        _ = try await w.flush()
         let r = try SessionStore.openReader(path: path)
         #expect(try r.targets() == [gw])
         let got = try r.probes(targetId: gw.id, fromMono: 0, toMono: 99 * 50_000_000)
@@ -35,21 +36,23 @@ func sampleMeta() -> SessionMeta {
         #expect(s.count == 100); #expect(s.lateCount == 1)
         #expect(try r.rowCount(table: "probe") == 100)
     }
-    @Test func duplicatePrimaryKeyIsRejected() throws {
+    @Test func duplicatePrimaryKeyIsRejected() async throws {
         let path = tempDBPath(); defer { try? FileManager.default.removeItem(atPath: path) }
         let w = try SessionStore.create(path: path, meta: sampleMeta())
-        var gw = SyntheticSession.target(id: 0, path: .wifi, role: .gateway); gw.id = try w.insertTarget(gw)
+        var gw = SyntheticSession.target(id: 0, path: .wifi, role: .gateway); gw.id = try await w.insertTarget(gw)
         let p = SyntheticSession.probes(target: gw, startNs: 0, count: 1, lostSeqs: [])
-        try w.write(probes: p)
-        #expect(throws: (any Error).self) { try w.write(probes: p) }
+        for q in p { await w.enqueue(q) }
+        _ = try await w.flush()
+        for q in p { await w.enqueue(q) }
+        await #expect(throws: (any Error).self) { try await w.flush() }
     }
 }
 
 @Suite struct SessionStoreExtraColumnsTests {
-    @Test func verdictReasonCodeAndOutageClosedAtEndRoundTrip() throws {
+    @Test func verdictReasonCodeAndOutageClosedAtEndRoundTrip() async throws {
         let path = tempDBPath(); defer { try? FileManager.default.removeItem(atPath: path) }
         let w = try SessionStore.create(path: path, meta: sampleMeta())
-        var gw = SyntheticSession.target(id: 0, path: .wifi, role: .gateway); gw.id = try w.insertTarget(gw)
+        var gw = SyntheticSession.target(id: 0, path: .wifi, role: .gateway); gw.id = try await w.insertTarget(gw)
         let c = try SQLiteConnection(path: path)
         try c.exec("""
             INSERT INTO event (id, start_mono, end_mono, duration_ms, bucket, suppressed) VALUES (1, 0, 400000000, 400, '0.2-0.5', 0);

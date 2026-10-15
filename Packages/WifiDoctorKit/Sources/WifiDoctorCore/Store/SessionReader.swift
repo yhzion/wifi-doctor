@@ -15,8 +15,10 @@ public struct ProbeStats: Sendable, Equatable {
     }
 }
 
-struct SessionStoreError: Error, CustomStringConvertible {
-    var description: String
+public struct SessionStoreError: Error, CustomStringConvertible, Equatable {
+    public var description: String
+    /// 디스크가 가득 참(`SQLITE_FULL`). 재시도하지 않습니다.
+    public static let diskFull = SessionStoreError(description: "disk full")
 }
 
 /// 읽기 전용 연결 하나를 `NSLock`으로 지킵니다. 모든 메서드가 락 안에서 문장을 끝까지 돌립니다.
