@@ -1,6 +1,6 @@
 import Foundation
 
-public struct CSVFileInfo: Sendable, Equatable {
+public struct CSVFileInfo: Sendable, Codable, Equatable {
     public var name: String
     public var rows: Int
     public init(name: String, rows: Int) {

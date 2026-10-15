@@ -1,6 +1,6 @@
 import Foundation
 
-public struct ProbeStats: Sendable, Equatable {
+public struct ProbeStats: Sendable, Codable, Equatable {
     public var count: Int64
     public var lateCount: Int64
     public var sendDelayP50Us: Int64
