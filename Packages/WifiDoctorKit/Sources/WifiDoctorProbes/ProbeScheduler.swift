@@ -48,10 +48,15 @@ final class ProbeScheduler<Transport: ProbeTransport>: @unchecked Sendable {
         var fireCount: Int = 0
     }
 
-    init(targets: [ProbeTarget], queue: DispatchQueue, transport: Transport) {
+    /// 시계 주입 손기(내부). 테스트가 sendDelayUs 계산을 결정적으로 검증하는 데 쓴다.
+    private let nowNs: @Sendable () -> Int64
+
+    init(targets: [ProbeTarget], queue: DispatchQueue, transport: Transport,
+         nowNs: @escaping @Sendable () -> Int64 = MonotonicClock.nowNs) {
         self.targets = targets
         self.queue = queue
         self.transport = transport
+        self.nowNs = nowNs
     }
 
     func start() -> AsyncStream<ProbeResult> {
@@ -63,6 +68,13 @@ final class ProbeScheduler<Transport: ProbeTransport>: @unchecked Sendable {
                 }
                 self.continuation = continuation
                 continuation.onTermination = { [weak self] _ in self?.stop() }
+                // 타깃별 상태는 시작 블록에서 만든다 — transport가 onReady 전에 결과를
+                // 반출해도 순서 버퍼가 이미 있어야 한다.
+                for target in targets {
+                    buffers[target.id] = SeqOrderBuffer()
+                    nextSeq[target.id] = 0
+                    slots[target.id] = Slot()
+                }
                 transport.start(
                     submit: { [weak self] result in self?.enqueue(result) },
                     onReady: { [weak self] in self?.armTimers() }
@@ -96,9 +108,6 @@ final class ProbeScheduler<Transport: ProbeTransport>: @unchecked Sendable {
         queue.async { [self] in
             guard !stopped, timers.isEmpty else { return }
             for target in targets {
-                buffers[target.id] = SeqOrderBuffer()
-                nextSeq[target.id] = 0
-                slots[target.id] = Slot()
                 let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
                 timer.schedule(deadline: .now(), repeating: .milliseconds(target.intervalMs), leeway: .milliseconds(1))
                 timer.setEventHandler { [weak self] in self?.fire(target: target) }
@@ -114,20 +123,20 @@ final class ProbeScheduler<Transport: ProbeTransport>: @unchecked Sendable {
     }
 
     private func fire(target: ProbeTarget) {
-        let nowNs = MonotonicClock.nowNs()
+        let actualNs = nowNs()
         guard var slot = slots[target.id] else { return }
-        if slot.fireCount == 0 { slot.originNs = nowNs }
+        if slot.fireCount == 0 { slot.originNs = actualNs }
         let scheduledNs = slot.originNs + Int64(slot.fireCount) * target.intervalNs
         slot.fireCount += 1
         slots[target.id] = slot
-        let sendDelayUs = max(0, (nowNs - scheduledNs) / 1000)
+        let sendDelayUs = max(0, (actualNs - scheduledNs) / 1000)
         let seq = nextSeq[target.id] ?? 0
         nextSeq[target.id] = seq + 1
         transport.send(target: target, seq: seq, tSendMonoNs: scheduledNs, sendDelayUs: sendDelayUs)
     }
 
     private func sweepExpired() {
-        transport.sweep(nowNs: MonotonicClock.nowNs())
+        transport.sweep(nowNs: nowNs())
     }
 
     /// 결과 행을 seq 순서로 내보낸다. transport의 수신 콜백 등 어느 큐에서나 불린다.
