@@ -106,4 +106,25 @@ import Testing
         } else { Issue.record("expected verdict") }
     }
     // 6.5절 가정용 표 4행은 결정표 1, 3, 8, 10행 케이스와 같음(위 arguments에 포함).
+
+    // 수정 1차(컨트롤러 판정)
+    @Test func sleepBeatsWiredOnly() {
+        var e = ev; e.wiredOnly = true; e.suppressed = true
+        #expect(Verdict.judge(event: e, status: st(.up, .up, .down, .down), stall: noStall, topology: .sameFirstHop, config: cfg, classify: { _ in nil }) == .suppressedBySleep)
+    }
+    @Test func wirelessWithoutSamplesNotesIt() {
+        let v = judge(st(.down, .up, .up, .up), cause: nil)
+        #expect(v?.wirelessCause == nil); #expect(v?.reason.contains("무선 샘플 없음") == true)
+    }
+    @Test func row14BeatsNoControl() {
+        let noWired = SessionConfig(wifiIf: "en0", wiredIf: nil, apMgmtIp: nil)
+        #expect(Verdict.judge(event: ev, status: st(.up, .up, .unknown, .unknown), stall: noStall, topology: .sameFirstHop, config: noWired, classify: { _ in nil }) == .noLossInWindow)
+    }
+    @Test func row14BeatsRow13() {
+        #expect(Verdict.judge(event: ev, status: st(.up, .up, .up, .unknown), stall: noStall, topology: .sameFirstHop, config: cfg, classify: { _ in nil }) == .noLossInWindow)
+    }
+    @Test func row7SameFirstHopSuspectsRouterInternals() {
+        #expect(judge(st(.up, .down, .up, .up))?.reason.contains("공유기 내부(무선 측 포워딩/NAT) 의심. 추가 확인 필요") == true)
+        #expect(judge(st(.up, .down, .up, .up), topo: .noMerge)?.reason.contains("공유기 내부") == false)
+    }
 }

@@ -2,14 +2,14 @@ import Foundation
 
 /// 6.3절 결정표. 전제 검사(P1~P4) 뒤 첫 일치 행을 씁니다.
 public enum Verdict {
-    /// `nil` 조건 = `*`. `segment == nil`은 14행(사건 아님).
+    /// `nil` 조건 = `*`. 14행은 전제 검사에서 처리합니다.
     private struct Row: Sendable {
         var gwW: TargetState?
         var inetW: GroupState?
         var gwE: TargetState?
         var inetE: GroupState?
         var topo: @Sendable (PathTopology) -> Bool = { _ in true }
-        var segment: Segment?
+        var segment: Segment
         var confidence: Confidence = .low
         var reasonCode: String? = nil
         var reason: @Sendable (PathTopology) -> String = { _ in "" }
@@ -66,7 +66,10 @@ public enum Verdict {
             reason: { _ in "와이파이 게이트웨이 응답 없음. 유선 게이트웨이 상태를 알 수 없어 대조 불가" }),
         // 7
         Row(gwW: .up, inetW: .down, gwE: .up, inetE: .up, segment: .wirelessUpstream, confidence: .medium,
-            reason: { _ in "와이파이 경로만 게이트웨이 이후 구간에서 인터넷 손실. 유선 경로는 정상" }),
+            reason: {
+                let base = "와이파이 경로만 게이트웨이 이후 구간에서 인터넷 손실. 유선 경로는 정상"
+                return $0 == .sameFirstHop ? base + ". 공유기 내부(무선 측 포워딩/NAT) 의심. 추가 확인 필요" : base   // 6.5
+            }),
         // 8
         Row(gwW: .up, inetW: .down, gwE: .up, inetE: .down, segment: .sharedUpstream, confidence: .high,
             reason: { _ in "두 경로 모두 게이트웨이는 응답하고 인터넷 손실. 게이트웨이 이후 공유 구간(공유기 WAN/NAT 또는 ISP/인터넷)" }),
@@ -89,8 +92,6 @@ public enum Verdict {
         Row(gwW: .up, gwE: .up, inetE: .unknown, segment: .undetermined, confidence: .low,
             reasonCode: "control_insufficient",
             reason: { _ in "유선 경로의 인터넷 상태를 알 수 없어 대조 불가" }),
-        // 14
-        Row(gwW: .up, inetW: .up, segment: nil),
         // 15
         Row(gwW: .unknown, inetW: .down, gwE: .up, inetE: .up, segment: .wireless, confidence: .low,
             reasonCode: "gateway_unknown",
@@ -115,13 +116,14 @@ public enum Verdict {
                                    evidence: evidence(status, stall, topology, secondary)))
         }
 
+        if event.suppressed { return .suppressedBySleep }                                       // P1
         if event.wiredOnly {
             return result(.wiredOnly, .high, nil, "유선 경로에서만 끊김. 와이파이 경로는 정상")
         }
-        if event.suppressed { return .suppressedBySleep }                                       // P1
         if stall.allTargetsDelayed {                                                             // P2
             return result(.hostStall, .high, nil, "창 안의 모든 대상에서 송신 지연. 맥 자체 지연")
         }
+        if status.gwW == .up && status.inetW == .up { return .noLossInWindow }                  // 14
         if status.controlForcedUnknown {
             return result(.undetermined, .low, "control_insufficient", "사건 창에서 유선 대조군 측정이 멈춰 대조 불가")
         }
@@ -133,12 +135,13 @@ public enum Verdict {
         }
 
         let row = rows.first { matches($0, status, topology) } ?? unmatched
-        guard let segment = row.segment else { return .noLossInWindow }                         // 14
+        let segment = row.segment
         var confidence = row.confidence
         if status.hasWeak { confidence = confidence.lowered() }
         if stall.someTargetsDelayed { confidence = confidence.lowered() }
         let cause = row.classify ? classify(event) : nil
         var reason = row.reason(topology)
+        if row.classify && cause == nil { reason += ". 무선 샘플 없음" }                           // 6.4
         if config.apMgmtIp != nil, segment == .wireless, let ap = status.apW {
             switch ap {
             case .up: reason += ". AP는 응답함. 무선 링크 또는 AP 무선부 문제"
