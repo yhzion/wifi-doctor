@@ -7,7 +7,11 @@ public struct WirelessThresholds: Sendable, Codable, Equatable {
     public var snrFloorDb: Int = 15
     public var rssiDropDb: Int = 10
     public static let `default` = WirelessThresholds()
-    public init() {}
+    public init(rssiFloorDbm: Int = -75, snrFloorDb: Int = 15, rssiDropDb: Int = 10) {
+        self.rssiFloorDbm = rssiFloorDbm
+        self.snrFloorDb = snrFloorDb
+        self.rssiDropDb = rssiDropDb
+    }
 }
 
 public struct SessionConfig: Sendable, Codable, Equatable {

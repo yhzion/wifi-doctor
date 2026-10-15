@@ -46,4 +46,12 @@ import Testing
         let back = try JSONDecoder().decode(ProbeResult.self, from: data)
         #expect(back == r)
     }
+
+    @Test func wirelessThresholdsOverride() {
+        let t = WirelessThresholds(rssiFloorDbm: -70)
+        #expect(t.rssiFloorDbm == -70)
+        #expect(t.snrFloorDb == 15)
+        #expect(t.rssiDropDb == 10)
+        #expect(WirelessThresholds() == .default)
+    }
 }
