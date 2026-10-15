@@ -8,15 +8,18 @@ import Testing
         let pipeline: SessionPipeline; let writer: SessionWriter; let path: String; let targets: [ProbeTarget]
         var wg: ProbeTarget { targets[0] }; var wi: ProbeTarget { targets[1] }
         var eg: ProbeTarget { targets[2] }; var ei: ProbeTarget { targets[3] }
+        var ap: ProbeTarget { targets[4] }
     }
 
     /// 와이파이 gw/inetA, 유선 gw/inetA 네 대상. 60초 분량.
-    func rig(wired: Bool = true) async throws -> Rig {
+    /// `apMgmt`면 다섯째 대상으로 와이파이 AP 관리 대상을 더합니다.
+    func rig(wired: Bool = true, apMgmt: Bool = false) async throws -> Rig {
         let path = tempDBPath()
         var meta = sampleMeta(); meta.wiredIf = wired ? "en11" : nil
         let w = try SessionStore.create(path: path, meta: meta)
         var ts = [SyntheticSession.target(id: 0, path: .wifi, role: .gateway), SyntheticSession.target(id: 0, path: .wifi, role: .internetA)]
         if wired { ts += [SyntheticSession.target(id: 0, path: .wired, role: .gateway), SyntheticSession.target(id: 0, path: .wired, role: .internetA)] }
+        if apMgmt { ts.append(SyntheticSession.target(id: 0, path: .wifi, role: .apMgmt)) }
         for i in ts.indices { ts[i].id = try await w.insertTarget(ts[i]) }
         let cfg = SessionConfig(wifiIf: "en0", wiredIf: wired ? "en11" : nil, apMgmtIp: nil)
         return Rig(pipeline: SessionPipeline(config: cfg, targets: ts, writer: w, topology: .sameFirstHop), writer: w, path: path, targets: ts)
@@ -145,5 +148,77 @@ import Testing
         let out = try await r.pipeline.finish()
         guard case .verdict(let v) = out[0].outcome else { Issue.record("no verdict"); return }
         #expect(v.segment == .wireless)
+    }
+    @Test(.timeLimit(.minutes(1))) func staleTargetDoesNotBlockVerdict() async throws {
+        let r = try await rig(apMgmt: true); defer { try? FileManager.default.removeItem(atPath: r.path) }
+        await feed(r, [SyntheticSession.probes(target: r.wg, startNs: 0, count: 600, lostSeqs: Set(400..<420)),
+                       SyntheticSession.probes(target: r.wi, startNs: 0, count: 150, lostSeqs: []),
+                       SyntheticSession.probes(target: r.eg, startNs: 0, count: 600, lostSeqs: []),
+                       SyntheticSession.probes(target: r.ei, startNs: 0, count: 150, lostSeqs: []),
+                       SyntheticSession.probes(target: r.ap, startNs: 0, count: 100, lostSeqs: [])])   // 5초에서 멈춤
+        var got: [PipelineOutput] = []
+        for await o in await r.pipeline.outputs { got.append(o); break }
+        #expect(got.count == 1)
+    }
+    @Test(.timeLimit(.minutes(1))) func retiredTargetDoesNotBlockVerdict() async throws {
+        let r = try await rig(apMgmt: true); defer { try? FileManager.default.removeItem(atPath: r.path) }
+        let split: Int64 = 19_500_000_000
+        let lists = [SyntheticSession.probes(target: r.wg, startNs: 0, count: 440, lostSeqs: Set(400..<420)),   // 22초까지
+                     SyntheticSession.probes(target: r.wi, startNs: 0, count: 110, lostSeqs: []),
+                     SyntheticSession.probes(target: r.eg, startNs: 0, count: 440, lostSeqs: []),
+                     SyntheticSession.probes(target: r.ei, startNs: 0, count: 110, lostSeqs: []),
+                     SyntheticSession.probes(target: r.ap, startNs: 0, count: 390, lostSeqs: [])]   // 19.5초에서 멈춤. 22초에는 아직 stale 아님
+        await feed(r, lists.map { $0.filter { $0.tSendMono < split } })
+        await r.pipeline.retireTarget(id: r.ap.id)
+        await feed(r, lists.map { $0.filter { $0.tSendMono >= split } })
+        var got: [PipelineOutput] = []
+        for await o in await r.pipeline.outputs { got.append(o); break }
+        #expect(got.count == 1)
+    }
+    @Test func openWiredRunIsAttachedToWifiEvent() async throws {
+        let r = try await rig(); defer { try? FileManager.default.removeItem(atPath: r.path) }
+        await feed(r, [SyntheticSession.probes(target: r.wg, startNs: 0, count: 1200, lostSeqs: Set(400..<420)),   // 20~21초
+                       SyntheticSession.probes(target: r.wi, startNs: 0, count: 300, lostSeqs: []),
+                       SyntheticSession.probes(target: r.eg, startNs: 0, count: 1200, lostSeqs: Set(400..<460)),   // 20~23초
+                       SyntheticSession.probes(target: r.ei, startNs: 0, count: 300, lostSeqs: [])])
+        let out = try await r.pipeline.finish()
+        #expect(out.count == 1)
+        #expect(out.first?.event.wiredOnly == false)
+        #expect(out.first?.event.outages.count == 2)
+        #expect(!out.contains { if case .verdict(let v) = $0.outcome { v.segment == .wiredOnly } else { false } })
+    }
+    @Test func openRunHoldIsCappedAt120Seconds() async throws {
+        let r = try await rig(); defer { try? FileManager.default.removeItem(atPath: r.path) }
+        await feed(r, [SyntheticSession.probes(target: r.wg, startNs: 0, count: 4800, lostSeqs: Set(400..<420)),   // 20~21초
+                       SyntheticSession.probes(target: r.wi, startNs: 0, count: 1200, lostSeqs: []),
+                       SyntheticSession.probes(target: r.eg, startNs: 0, count: 4800, lostSeqs: Set(400..<4000)),  // 20~200초
+                       SyntheticSession.probes(target: r.ei, startNs: 0, count: 1200, lostSeqs: [])])
+        let out = try await r.pipeline.finish()
+        #expect(out.count == 2)
+        #expect(out.first?.event.wiredOnly == false); #expect(out.first?.event.outages.count == 1)
+        #expect(out.last?.event.wiredOnly == true)
+    }
+    @Test func deferredEventIsJudgedOnCompleteData() async throws {
+        let r = try await rig(); defer { try? FileManager.default.removeItem(atPath: r.path) }
+        await feed(r, [SyntheticSession.probes(target: r.wg, startNs: 0, count: 14_400, lostSeqs: Set(200..<14_000)),  // 10~700초
+                       SyntheticSession.probes(target: r.wi, startNs: 0, count: 3600, lostSeqs: []),
+                       SyntheticSession.probes(target: r.eg, startNs: 0, count: 14_400, lostSeqs: []),
+                       SyntheticSession.probes(target: r.ei, startNs: 0, count: 3600, lostSeqs: [])])
+        let out = try await r.pipeline.finish()
+        guard case .verdict(let v) = out.first?.outcome else { Issue.record("no verdict"); return }
+        #expect(v.evidence.contains("\"lost_count\":13800,\"probe_count\":13801"))
+    }
+    @Test func finishIsIdempotentAndStopsIngest() async throws {
+        let r = try await rig(); defer { try? FileManager.default.removeItem(atPath: r.path) }
+        await feed(r, [SyntheticSession.probes(target: r.wg, startNs: 0, count: 600, lostSeqs: Set(580..<600)),
+                       SyntheticSession.probes(target: r.wi, startNs: 0, count: 150, lostSeqs: []),
+                       SyntheticSession.probes(target: r.eg, startNs: 0, count: 600, lostSeqs: []),
+                       SyntheticSession.probes(target: r.ei, startNs: 0, count: 150, lostSeqs: [])])
+        let first = try await r.pipeline.finish()
+        await r.pipeline.ingest(ProbeResult(targetId: r.wg.id, seq: 600, tSendMono: 30 * S, sendDelayUs: 0,
+                                            rttUs: 1000, status: .ok, ttl: nil))
+        let second = try await r.pipeline.finish()
+        #expect(first == second); #expect(first.count == 1)
+        #expect(await r.pipeline.recentProbes(sinceNs: 30 * S).isEmpty)
     }
 }

@@ -14,6 +14,9 @@ public struct PipelineOutput: Sendable, Equatable {
 public actor SessionPipeline {
     private static let ringSpanNs: Int64 = 600_000_000_000          // 링 버퍼 10분
     private static let settleLagNs: Int64 = 700_000_000             // R8: 창 확장 0.2초 + 병합 대기 0.5초
+    private static let staleNs: Int64 = 3_000_000_000               // 최근 프로브보다 3초 넘게 뒤처진 대상은 기다리지 않음
+    private static let holdCapNs: Int64 = 120_000_000_000           // 열린 run 대기 상한
+    private static let classifierLeadNs: Int64 = 63_000_000_000     // 무선 분류 기준선 60초 + 창 앞 3초
     private static let trimEvery = 100
     private static let diskLowBytes: Int64 = 500_000_000
 
@@ -30,6 +33,9 @@ public actor SessionPipeline {
     private var controlBlackouts: [(start: Int64, end: Int64)] = []
     private var closedOutages: [TargetOutage] = []
     private var lastSeenByTarget: [Int: Int64] = [:]
+    private var openRunStart: [Int: Int64] = [:]                    // 대상별 열린 손실 run의 첫 손실 송신 시각
+    private var latestProbeMono: Int64 = 0
+    private var finished = false
     private var okCounts: [Int: Int] = [:]
     private var latestMono: Int64 = 0
     private var ingestCount = 0
@@ -56,21 +62,31 @@ public actor SessionPipeline {
     /// gateway_changed: 이전 gateway 대상의 검출기를 닫고 새 대상을 추가합니다. 이전 대상은 창 상태 계산용으로 남깁니다.
     public func replaceGatewayTarget(path: NetPath, with newTarget: ProbeTarget) {
         for id in activeTargetIds.sorted() where targets[id]?.path == path && targets[id]?.role == .gateway {
-            if let o = detectors[id]?.finish() { closedOutages.append(o) }
-            detectors[id] = nil
-            activeTargetIds.remove(id)
+            retire(id)
         }
         targets[newTarget.id] = newTarget
         detectors[newTarget.id] = OutageDetector(target: newTarget)
         activeTargetIds.insert(newTarget.id)
     }
 
+    /// 측정을 멈춘 대상(예: AP 관리 Prober 중지). 검출기를 닫고 판정 기준 시각 계산에서 뺍니다.
+    public func retireTarget(id: Int) { retire(id) }
+
     public func ingest(_ r: ProbeResult) async {
+        guard !finished else { return }
         ring.append(r)
         lastSeenByTarget[r.targetId] = max(lastSeenByTarget[r.targetId] ?? .min, r.tSendMono)
+        latestProbeMono = max(latestProbeMono, r.tSendMono)
         if r.status == .ok { okCounts[r.targetId, default: 0] += 1 }
         // 늦게 온 순번 역순 프로브(이미 닫힌 run 뒤의 ok)는 검출기에서 아무 일도 하지 않습니다.
-        if let o = detectors[r.targetId]?.feed(r) { closedOutages.append(o) }
+        if detectors[r.targetId] != nil {
+            if let o = detectors[r.targetId]?.feed(r) { closedOutages.append(o) }
+            if !r.status.isLost {
+                openRunStart[r.targetId] = nil
+            } else if openRunStart[r.targetId] == nil {
+                openRunStart[r.targetId] = r.tSendMono
+            }
+        }
         advance(to: r.tSendMono)
         let judged = settle(force: false)
         if recording { await writer.enqueue(r) }
@@ -78,12 +94,14 @@ public actor SessionPipeline {
     }
 
     public func ingest(_ s: WirelessSample) async {
+        guard !finished else { return }
         samples.append(s)
         advance(to: s.tMono)
         if recording { await writer.enqueue(s) }
     }
 
     public func ingest(_ e: LinkEvent) async {
+        guard !finished else { return }
         linkEvents.append(e)
         advance(to: e.tMono)
         await writer.enqueue(e)
@@ -95,10 +113,9 @@ public actor SessionPipeline {
             sleepIntervals.append((start: e.tMono, end: .max))
         case .didWake:
             if let i = sleepIntervals.indices.last, sleepIntervals[i].end == .max { sleepIntervals[i].end = e.tMono }
-        case .interfaceLost where config.wiredIf != nil && e.detail == config.wiredIf:
+        case .interfaceLost:                        // interface_lost/back은 유선 인터페이스만 가리킵니다.
             controlBlackouts.append((start: e.tMono, end: .max))
-        case .interfaceBack where e.detail != config.wifiIf:
-            // 유선 BSD 이름이 바뀌면 interface_back은 새 이름을 싣습니다(8장).
+        case .interfaceBack:
             if let i = controlBlackouts.indices.last, controlBlackouts[i].end == .max { controlBlackouts[i].end = e.tMono }
         case .diskLow:
             if let free = e.detail.flatMap({ Int64($0) }), free < Self.diskLowBytes { recording = false }
@@ -123,16 +140,20 @@ public actor SessionPipeline {
     }
 
     /// 열린 끊김을 닫고 남은 사건을 모두 판정합니다. 세션 전체의 출력을 돌려줍니다.
+    /// 상태 변경과 판정은 첫 await 전에 끝냅니다. 두 번째 호출은 같은 출력을 돌려줍니다.
     public func finish() async throws -> [PipelineOutput] {
+        guard !finished else { return allOutputs }
+        finished = true
+        var openAtEnd: [SystemEvent] = []
         for id in detectors.keys.sorted() {
             guard let o = detectors[id]?.finish() else { continue }
             closedOutages.append(o)
-            if o.closedAtEnd {
-                await writer.enqueue(SystemEvent(tMono: o.endMono, kind: .probeError, detail: "open_at_end"))
-            }
+            if o.closedAtEnd { openAtEnd.append(SystemEvent(tMono: o.endMono, kind: .probeError, detail: "open_at_end")) }
         }
+        openRunStart.removeAll()
         let judged = settle(force: true)
         continuation.finish()
+        for e in openAtEnd { await writer.enqueue(e) }
         await store(judged)
         try await flushStore()
         return allOutputs
@@ -144,24 +165,58 @@ public actor SessionPipeline {
 
     // MARK: - 내부
 
+    /// 대상을 은퇴시킵니다. 열린 run은 세션 종료가 아니라 교체·중지로 잘린 것이므로 closedAtEnd = false.
+    private func retire(_ id: Int) {
+        if var o = detectors[id]?.finish() {
+            o.closedAtEnd = false
+            closedOutages.append(o)
+        }
+        detectors[id] = nil
+        openRunStart[id] = nil
+        activeTargetIds.remove(id)
+    }
+
+    /// 판정 기준 시각에 쓰는 대상: 은퇴하지 않았고, 최근 프로브보다 3초 넘게 뒤처지지 않은 대상.
+    private func liveTargetIds() -> [Int] {
+        let staleBefore = latestProbeMono - Self.staleNs
+        return activeTargetIds.filter { (lastSeenByTarget[$0] ?? .min) >= staleBefore }
+    }
+
     private func advance(to t: Int64) {
         latestMono = max(latestMono, t)
         ingestCount += 1
         guard ingestCount % Self.trimEvery == 0 else { return }
-        let cutoff = latestMono - Self.ringSpanNs
+        // 아직 판정하지 않은 끊김과 열린 run의 데이터는 무선 분류 기준선까지 남깁니다.
+        var cutoff = latestMono - Self.ringSpanNs
+        let pending = closedOutages.map(\.startMono) + liveTargetIds().compactMap { openRunStart[$0] }
+        if let oldest = pending.min() { cutoff = min(cutoff, oldest - Self.classifierLeadNs) }
         ring.removeAll { $0.tSendMono < cutoff }
         samples.removeAll { $0.tMono < cutoff }
         linkEvents.removeAll { $0.tMono < cutoff }
     }
 
-    /// R8: 모든 활성 대상의 마지막 관측 tSendMono ≥ event.end + 0.7초인 사건만 확정합니다. `force`면 조건을 무시합니다.
+    /// 사건 확정 조건. `force`면 모두 확정합니다.
+    /// R8: 살아 있는 대상의 마지막 관측 tSendMono 최솟값(watermark) ≥ event.end + 0.7초.
+    /// 12장: 그리고 살아 있는 대상에 run 시작 ≤ event.end + 0.5초인 열린 손실 run이 없어야 합니다
+    /// (유선 blackout이 열려 있으면 유선 run은 무시). watermark ≥ event.end + 120초면 기다리지 않습니다.
     /// 확정·판정·출력은 동기로 끝냅니다. 저장은 호출자가 `store`로 합니다.
     private func settle(force: Bool) -> [PipelineOutput] {
         guard !closedOutages.isEmpty else { return [] }
-        let watermark = activeTargetIds.map { lastSeenByTarget[$0] ?? .min }.min() ?? .min
+        let live = liveTargetIds()
+        let watermark = live.map { lastSeenByTarget[$0] ?? .min }.min() ?? .min
+        let blackoutOpen = controlBlackouts.last?.end == .max
+        let openStarts = live.compactMap { id -> Int64? in
+            if blackoutOpen && targets[id]?.path == .wired { return nil }
+            return openRunStart[id]
+        }
+        func isFinal(_ e: OutageEvent) -> Bool {
+            guard watermark >= e.endMono + Self.settleLagNs else { return false }
+            if watermark >= e.endMono + Self.holdCapNs { return true }
+            return !openStarts.contains { $0 <= e.endMono + EventGrouper.mergeGapNs }
+        }
         let candidates = EventGrouper.group(outages: closedOutages, targets: targets, sleepIntervals: sleepIntervals)
         var judged: [PipelineOutput] = []
-        for var event in candidates where force || watermark >= event.endMono + Self.settleLagNs {
+        for var event in candidates where force || isFinal(event) {
             closedOutages.removeAll { event.outages.contains($0) }
             event.id = nextEventId
             nextEventId += 1
