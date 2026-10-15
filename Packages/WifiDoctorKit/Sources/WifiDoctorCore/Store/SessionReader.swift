@@ -189,23 +189,23 @@ public final class SessionReader: @unchecked Sendable {
         return lists
     }
 
-    /// `closedAtEnd`는 스키마에 열이 없어 항상 false입니다.
     public func outages() throws -> [TargetOutage] {
         try query("""
-            SELECT target_id, start_mono, end_mono, lost_count, first_seq, last_seq FROM outage ORDER BY id
+            SELECT target_id, start_mono, end_mono, lost_count, first_seq, last_seq, closed_at_end FROM outage ORDER BY id
             """) { s in Self.outage(s) }
     }
 
     private static func outage(_ s: SQLiteStatement) -> TargetOutage {
         TargetOutage(targetId: Int(s.int64(0)!), startMono: s.int64(1)!, endMono: s.int64(2)!,
-                     lostCount: Int(s.int64(3)!), firstSeq: s.int64(4)!, lastSeq: s.int64(5)!, closedAtEnd: false)
+                     lostCount: Int(s.int64(3)!), firstSeq: s.int64(4)!, lastSeq: s.int64(5)!, closedAtEnd: s.int64(6)! != 0)
     }
 
     /// `wiredOnly` = 사건의 끊김이 하나 이상이고 모두 유선 대상. 대상 행이 없는 끊김은 유선이 아닌 것으로 칩니다.
     public func events() throws -> [OutageEvent] {
         let wiredIds = Set(try targets().filter { $0.path == .wired }.map(\.id))
         let rows = try query("""
-            SELECT event_id, target_id, start_mono, end_mono, lost_count, first_seq, last_seq FROM outage
+            SELECT event_id, target_id, start_mono, end_mono, lost_count, first_seq, last_seq,
+              closed_at_end FROM outage
             WHERE event_id IS NOT NULL ORDER BY id
             """) { s in (eventId: Int(s.int64(0)!), outage: Self.outage(shifted: s)) }
         var byEvent: [Int: [TargetOutage]] = [:]
@@ -221,18 +221,17 @@ public final class SessionReader: @unchecked Sendable {
 
     private static func outage(shifted s: SQLiteStatement) -> TargetOutage {
         TargetOutage(targetId: Int(s.int64(1)!), startMono: s.int64(2)!, endMono: s.int64(3)!,
-                     lostCount: Int(s.int64(4)!), firstSeq: s.int64(5)!, lastSeq: s.int64(6)!, closedAtEnd: false)
+                     lostCount: Int(s.int64(4)!), firstSeq: s.int64(5)!, lastSeq: s.int64(6)!, closedAtEnd: s.int64(7)! != 0)
     }
 
-    /// `reasonCode`는 스키마에 열이 없어 항상 nil입니다.
     public func verdicts() throws -> [VerdictResult] {
         try query("""
-            SELECT event_id, segment, wireless_cause, confidence, reason, evidence FROM verdict ORDER BY event_id
+            SELECT event_id, segment, wireless_cause, confidence, reason, evidence, reason_code FROM verdict ORDER BY event_id
             """) { s in
             VerdictResult(eventId: Int(s.int64(0)!), segment: try Self.parse(Segment.self, s.text(1), "segment"),
                           wirelessCause: try s.text(2).map { try Self.parse(WirelessCause.self, $0, "wireless cause") },
                           confidence: try Self.parse(Confidence.self, s.text(3), "confidence"),
-                          reasonCode: nil, reason: s.text(4)!, evidence: s.text(5)!)
+                          reasonCode: s.text(6), reason: s.text(4)!, evidence: s.text(5)!)
         }
     }
 

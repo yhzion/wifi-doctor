@@ -108,7 +108,8 @@ public struct SessionStore {
       lost_count  INTEGER NOT NULL,
       first_seq   INTEGER NOT NULL,
       last_seq    INTEGER NOT NULL,
-      event_id    INTEGER REFERENCES event(id)
+      event_id    INTEGER REFERENCES event(id),
+      closed_at_end INTEGER NOT NULL DEFAULT 0  -- 세션 종료로 닫힘(5.1절 6항)
     );
 
     CREATE TABLE verdict (
@@ -116,6 +117,7 @@ public struct SessionStore {
       segment         TEXT NOT NULL,   -- 1.2절 구간 ID
       wireless_cause  TEXT,            -- coverage_interference | congestion_ap | roaming | disconnect | NULL
       confidence      TEXT NOT NULL,   -- high | medium | low
+      reason_code     TEXT,            -- 6.3절 사유 코드. 없으면 NULL
       reason          TEXT NOT NULL,   -- 사람이 읽는 근거 한 문단
       evidence        TEXT NOT NULL    -- JSON. 대상별 상태와 손실률
     );
