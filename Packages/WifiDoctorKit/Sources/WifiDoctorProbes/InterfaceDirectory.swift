@@ -43,7 +43,7 @@ public final class InterfaceDirectory: Sendable {
         Self.snapshot(store: nil).first { $0.bsdName == name }
     }
 
-    /// 감시 이름 전체의 게이트웨이 변경(gatewayChanged)과
+    /// 감시 이름(및 재바인딩된 유선의 새 이름)의 게이트웨이 변경(gatewayChanged)과
     /// 유선 후보의 소실·복귀(interfaceLost / interfaceBack, 유선만. 와이파이는 내지 않는다)을 SystemEvent로 냄.
     /// detail에는 bsd 이름만 넣는다. 새 게이트웨이 주소는 이벤트가 아니라 새 target 행에 들어간다.
     public func changes(watching names: [String]) -> AsyncStream<SystemEvent> {
@@ -96,6 +96,68 @@ extension InterfaceDirectory {
         !i.isWifi && i.ipv4 != nil && i.hasLink
     }
 
+    /// 유선 감시 상태. tracked: 현재 접속된 감시 대상 유선 포트(bsd → displayName).
+    /// lostPorts: 끊겨서 복귀를 기다리는 포트.
+    struct WiredState: Sendable {
+        var tracked: [String: String] = [:]
+        var lostPorts: [LostPort] = []
+
+        struct LostPort: Sendable {
+            var bsd: String
+            var displayName: String
+        }
+    }
+
+    /// changes()의 diff 단계. 순수 함수 — 단위 테스트 대상.
+    /// prev/next: bsd 이름 → 인터페이스 스냅샷. wired: 유선 추적 상태.
+    /// tMono는 호출자가 MonotonicClock.nowNs()로 채운다.
+    /// 게이트웨이 비교 대상은 watched ∪ 이번 라운드 추적 이름이다.
+    /// 유선이 다른 bsd 이름으로 재바인딩되면(8장) 새 이름이 추적 집합에 들어와
+    /// 이후 그 이름의 게이트웨이 변경이 gatewayChanged로 나온다.
+    static func diff(
+        prev: [String: NetInterface],
+        wired: WiredState,
+        next: [String: NetInterface],
+        watched: Set<String>,
+        tMono: Int64
+    ) -> (events: [SystemEvent], wired: WiredState) {
+        let newWired = next.values.filter(isWiredCandidate)
+        var events: [SystemEvent] = []
+        var nextTracked: [String: String] = [:]
+        var nextLost = wired.lostPorts
+
+        // 1) 감시 중이던 유선이 후보 목록에서 사라짐. 와이파이는 대상이 아니다.
+        for (bsd, displayName) in wired.tracked {
+            if newWired.contains(where: { $0.bsdName == bsd }) {
+                nextTracked[bsd] = displayName
+            } else {
+                events.append(SystemEvent(tMono: tMono, kind: .interfaceLost, detail: bsd))
+                nextLost.append(WiredState.LostPort(bsd: bsd, displayName: displayName))
+            }
+        }
+
+        // 2) 새로 나타난 유선. 잃었던 포트와 bsd 이름이 같거나 displayName이 같으면 복귀(8장).
+        //    감시 이름의 첫 등장은 "돌아옴"이 아니므로 추적만 한다.
+        for w in newWired where nextTracked[w.bsdName] == nil {
+            if let i = nextLost.firstIndex(where: { $0.bsd == w.bsdName || $0.displayName == w.displayName }) {
+                events.append(SystemEvent(tMono: tMono, kind: .interfaceBack, detail: w.bsdName))
+                nextLost.remove(at: i)
+                nextTracked[w.bsdName] = w.displayName
+            } else if watched.contains(w.bsdName) {
+                nextTracked[w.bsdName] = w.displayName
+            }
+        }
+
+        // 3) 게이트웨이 변경. nil <-> 주소 전환도 변경이다.
+        for name in watched.union(nextTracked.keys).sorted() {
+            if prev[name]?.gateway != next[name]?.gateway {
+                events.append(SystemEvent(tMono: tMono, kind: .gatewayChanged, detail: name))
+            }
+        }
+
+        return (events, WiredState(tracked: nextTracked, lostPorts: nextLost))
+    }
+
     struct LinkInfo { var ipv4: String?; var running: Bool }
 
     /// getifaddrs: 첫 AF_INET 주소와 IFF_RUNNING.
@@ -137,11 +199,8 @@ private final class ChangeWatcher: @unchecked Sendable {
     private var store: SCDynamicStore?
     private var stopped = false
     private var prevByBsd: [String: NetInterface] = [:]
-    /// bsdName -> displayName. 현재 접속된 감시 대상 유선 포트.
-    private var tracked: [String: String] = [:]
-    /// 끊겨서 복귀를 기다리는 유선 포트. 8장: 같은 displayName(하드웨어 포트)이면
-    /// 다른 bsd 이름으로 나타나도 "돌아옴"으로 본다.
-    private var lostPorts: [(bsd: String, displayName: String)] = []
+    /// 유선 소실·복귀 추적 상태(8장: 같은 displayName이면 다른 bsd 이름도 "돌아옴").
+    private var wiredState = InterfaceDirectory.WiredState()
 
     init(watched: Set<String>, continuation: AsyncStream<SystemEvent>.Continuation) {
         self.watched = watched
@@ -181,7 +240,7 @@ private final class ChangeWatcher: @unchecked Sendable {
         // 초기 스냅샷. 콜백 큐 설정 전이라 경합이 없다.
         let snap = InterfaceDirectory.snapshot(store: store)
         prevByBsd = Dictionary(snap.map { ($0.bsdName, $0) }, uniquingKeysWith: { a, _ in a })
-        tracked = Dictionary(
+        wiredState.tracked = Dictionary(
             snap.filter { InterfaceDirectory.isWiredCandidate($0) && watched.contains($0.bsdName) }
                 .map { ($0.bsdName, $0.displayName) },
             uniquingKeysWith: { a, _ in a }
@@ -205,46 +264,16 @@ private final class ChangeWatcher: @unchecked Sendable {
         }
     }
 
-    /// 큐에서만 실행. 알림 키는 무시하고 매번 전체 스냅샷을 다시 만들어 이전 상태와 비교한다.
+    /// 큐에서만 실행. 알림 키는 무시하고 매번 전체 스냅샷을 다시 만들어 diff로 비교한다.
     private func handleChange() {
         guard !stopped, let store else { return }
         let snap = InterfaceDirectory.snapshot(store: store)
         let byBsd = Dictionary(snap.map { ($0.bsdName, $0) }, uniquingKeysWith: { a, _ in a })
-        let newWired = snap.filter(InterfaceDirectory.isWiredCandidate)
-        var events: [SystemEvent] = []
-        let t = MonotonicClock.nowNs()
-
-        // 1) 감시 중이던 유선이 후보 목록에서 사라짐. 와이파이는 대상이 아니다.
-        var nextTracked: [String: String] = [:]
-        for (bsd, displayName) in tracked {
-            if newWired.contains(where: { $0.bsdName == bsd }) {
-                nextTracked[bsd] = displayName
-            } else {
-                events.append(SystemEvent(tMono: t, kind: .interfaceLost, detail: bsd))
-                lostPorts.append((bsd: bsd, displayName: displayName))
-            }
-        }
-
-        // 2) 새로 나타난 유선. 잃었던 포트와 bsd 이름이 같거나 displayName이 같으면 복귀(8장).
-        //    감시 이름의 첫 등장은 "돌아옴"이 아니므로 추적만 한다.
-        for w in newWired where nextTracked[w.bsdName] == nil {
-            if let i = lostPorts.firstIndex(where: { $0.bsd == w.bsdName || $0.displayName == w.displayName }) {
-                events.append(SystemEvent(tMono: t, kind: .interfaceBack, detail: w.bsdName))
-                lostPorts.remove(at: i)
-                nextTracked[w.bsdName] = w.displayName
-            } else if watched.contains(w.bsdName) {
-                nextTracked[w.bsdName] = w.displayName
-            }
-        }
-
-        // 3) 감시 이름 전체의 게이트웨이 변경. nil <-> 주소 전환도 변경이다.
-        for name in watched.sorted() {
-            if prevByBsd[name]?.gateway != byBsd[name]?.gateway {
-                events.append(SystemEvent(tMono: t, kind: .gatewayChanged, detail: name))
-            }
-        }
-
-        tracked = nextTracked
+        let (events, newState) = InterfaceDirectory.diff(
+            prev: prevByBsd, wired: wiredState, next: byBsd,
+            watched: watched, tMono: MonotonicClock.nowNs()
+        )
+        wiredState = newState
         prevByBsd = byBsd
         for e in events { continuation.yield(e) }
     }
