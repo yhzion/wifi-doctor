@@ -151,7 +151,8 @@ public protocol Prober: Sendable {
 - 무엇: Wi-Fi 링크 상태 샘플과 이벤트.
 - 어떻게:
   - `CWWiFiClient.shared().interface(withName:)`.
-  - 0.2초마다 `rssiValue()`, `noiseMeasurement()`, `transmitRate()`, `wlanChannel()`, `interfaceState`, `bssid()`, `ssid()`를 읽어 `WirelessSample`을 냅니다. SNR = RSSI − 노이즈.
+  - 0.2초마다 `rssiValue()`, `noiseMeasurement()`, `transmitRate()`, `wlanChannel()`, `powerOn()`, `interfaceMode()`, `bssid()`, `ssid()`를 읽어 `WirelessSample`을 냅니다. SNR = RSSI − 노이즈.
+  - 링크 상태 `state`는 앱 정의 값입니다(SDK에 `interfaceState`가 없음. 7.3절). `0 off` = `powerOn() == false`. `1 disconnected` = `powerOn()`이고 `interfaceMode() != station`. `2 associated` = `interfaceMode() == station`. 위치 권한 없이도 계산할 수 있습니다. `rssiValue()`, `noiseMeasurement()`, `transmitRate()`가 0이면(미참여) `nil`로 저장합니다.
   - `startMonitoringEvent(with:)`로 `linkDidChange`, `bssidDidChange`, `ssidDidChange`, `linkQualityDidChange`, `scanCacheUpdated`, `powerDidChange`를 구독합니다. `CWEventDelegate` 콜백을 `LinkEvent`로 냅니다.
   - `scanForNetworks`는 호출하지 않습니다. `scanCacheUpdated` 이벤트는 OS 또는 다른 프로세스가 스캔했음을 뜻합니다. 기록만 합니다.
   - 위치 권한이 없으면 `ssid()`와 `bssid()`가 nil입니다(7.3절). 샘플에는 nil로 저장합니다. 로밍 판정은 `bssidDidChange` 이벤트로 합니다.
@@ -296,7 +297,7 @@ CREATE INDEX probe_time ON probe(target_id, t_send_mono);
 
 CREATE TABLE wireless_sample (
   t_mono      INTEGER PRIMARY KEY,  -- ns, 0.2초 간격
-  state       INTEGER NOT NULL,     -- CWInterfaceState 원값
+  state       INTEGER NOT NULL,     -- 앱 정의 값: 0 off, 1 disconnected, 2 associated
   rssi_dbm    INTEGER,
   noise_dbm   INTEGER,
   tx_rate_mbps REAL,
@@ -536,7 +537,7 @@ AP 관리 IP가 있을 때(선택): `AP_w` 상태를 추가로 계산합니다. 
 
 | 순서 | 조건 | 원인 |
 |---|---|---|
-| 1 | 창 안에 `link_down` 이벤트 또는 `state != running` 샘플 | `disconnect` (연결 끊김) |
+| 1 | 창 안에 `link_down` 이벤트 또는 `state != associated` 샘플 | `disconnect` (연결 끊김) |
 | 2 | 창 안에 `bssid_changed` 이벤트 | `roaming` (로밍) |
 | 3 | 창 안 RSSI 최솟값 ≤ −75 dBm, 또는 SNR 최솟값 ≤ 15 dB, 또는 기준선 대비 RSSI 하락 ≥ 10 dB | `coverage_interference` (커버리지·간섭) |
 | 4 | 그 외(신호 양호) | `congestion_ap` (채널 혼잡·AP 처리) |
@@ -617,8 +618,9 @@ func judge(event, topology, config) -> VerdictResult:
 ### 7.3 CoreWLAN과 위치 권한
 
 - **확인됨(SDK 헤더)**: `CWInterface.ssid()`, `ssidData()`, `bssid()`, `countryCode()`는 "Location Services가 켜져 있고 앱이 위치 사용 권한을 받았을 때만" 값을 돌려줍니다. 아니면 nil입니다.
-- **확인됨(SDK 헤더)**: `rssiValue()`, `noiseMeasurement()`, `transmitRate()`, `wlanChannel()`, `interfaceState`에는 그런 주석이 없습니다.
-- **검증 필요**: 위 다섯 값이 권한 없이 실제로 읽히는지. 헤더만으로는 단언할 수 없습니다.
+- **확인됨(SDK 헤더)**: `rssiValue()`, `noiseMeasurement()`, `transmitRate()`, `wlanChannel()`, `powerOn()`, `interfaceMode()`에는 그런 주석이 없습니다.
+- **확인됨(SDK 헤더)**: macOS 27 SDK `CWInterface.h`에 `interfaceState` 메서드와 `CWInterfaceState` 열거형이 없습니다. 있는 것은 `powerOn()`, `interfaceMode()`(`kCWInterfaceModeNone/Station/IBSS/HostAP`), `serviceActive()`입니다. 헤더 주석은 `rssiValue()`, `noiseMeasurement()`, `transmitRate()`가 "인터페이스가 Wi-Fi 네트워크에 참여하지 않으면 0"을, `interfaceMode()`가 그때 `kCWInterfaceModeNone`을 돌려준다고 적습니다. 대체: 링크 상태는 `powerOn()`과 `interfaceMode()`로 계산한 앱 정의 값(3.2절 WirelessMonitor)으로 기록합니다.
+- **검증 필요**: 위 여섯 값이 권한 없이 실제로 읽히는지. Wi-Fi를 끊었을 때 `interfaceMode()`가 `none`으로 바뀌는지. 헤더만으로는 단언할 수 없습니다.
 - **검증 필요**: 권한이 없을 때 `bssidDidChange` 이벤트가 발생하는지. 발생하면 BSSID 값 없이도 로밍을 검출할 수 있습니다. 발생하지 않으면 로밍 세분은 권한 없이는 불가능합니다. 보고서에 그 한계를 적습니다.
 - **확인됨(SDK 헤더)**: `CLLocationManager.requestWhenInUseAuthorization()`은 macOS 10.15부터 있습니다. Info.plist에 `NSLocationUsageDescription`을 넣습니다. 앱은 위치 자체를 쓰지 않습니다. 권한만 받습니다.
 - **확인됨(SDK 헤더, 사용 중단)**: `CWInterface.interfaceNames()`, `CWInterface.interface()`, `CWInterface.interfaceWithName:`, `CWInterface.initWithInterfaceName:`는 10.10에서 사용 중단. `CWWiFiClient.interfaceNames()` 클래스 메서드는 13.0에서 사용 중단(인스턴스 메서드로 대체). `startIBSSMode`는 11.0에서 사용 중단. 앱은 `CWWiFiClient.shared()`와 인스턴스 메서드만 씁니다.
@@ -687,7 +689,7 @@ func judge(event, topology, config) -> VerdictResult:
 | 유선 미연결(세션 시작 시) | InterfaceDirectory에 유선 후보 없음 | 사용자에게 "대조군 없이 시작" 확인. 시작하면 `wired_if = NULL`. 모든 판정 `UNDETERMINED(no_control)` | `session.wired_if = NULL` |
 | 유선 인터페이스 사라짐(세션 중) | SCDynamicStore 알림, `sendto` `ENXIO`/`EHOSTUNREACH` 연속 | 유선 프로브는 계속 시도. 결과는 `status = 4`. 유선 대상 끊김이 생기지만 `WIRED_ONLY`. 그 창의 와이파이 사건은 `GW_e`/`INET_e`가 `DOWN`으로 보이므로 오판 위험. 그래서 `interface_lost`~`interface_back` 구간의 와이파이 사건은 대조군을 `UNKNOWN`으로 강제 → `UNDETERMINED(control_insufficient)` | `system_event(interface_lost / interface_back)` |
 | 유선 인터페이스 BSD 이름 변경(재연결 후) | 알림의 인터페이스 목록 비교 | 같은 하드웨어 포트 이름(`SCNetworkInterfaceGetLocalizedDisplayName`)이면 새 이름으로 재바인딩. 소켓 재생성 | `system_event(interface_back, detail: 새 이름)` |
-| Wi-Fi 인터페이스 꺼짐 | `powerDidChange`, `state` | 측정 계속. 손실로 기록. 세분은 `disconnect` | `link_event(power_changed)` |
+| Wi-Fi 인터페이스 꺼짐 | `powerDidChange`, `state = 0 (off)` | 측정 계속. 손실로 기록. 세분은 `disconnect` | `link_event(power_changed)` |
 | 게이트웨이 주소 변경(DHCP) | SCDynamicStore `Router` 변경 | 새 `target` 행 추가. 이전 대상 중단. 보고서에 변경 시각 표기 | `system_event(gateway_changed)` |
 | 위치 권한 거부 | `CLLocationManager` 상태 | 계속 진행. SSID/BSSID NULL. 보고서에 "권한 없음, 로밍 세분 제한"을 적음 | `session.location_auth` |
 | ICMP 소켓 생성 실패 | `socket()` 오류 | 세션 시작 거부. 오류 메시지와 errno 표시 | 없음(세션 없음) |
@@ -910,3 +912,4 @@ Swift 설정:
 - 4.3절 시간 기준과 5.2절 "정렬 허용 오차 0.5초"의 근거가 연결됩니다.
 - 5.3절 상태 창을 `[start, end]`로 두고 프로브가 없을 때만 넓히도록 고쳤습니다. 처음 초안의 "항상 ±0.2초"는 짧은 끊김을 `UP`으로 오판했습니다.
 - 크기: 모듈 13개, 테이블 11개, 결정표 17행. 구현 계획 하나로 다룰 수 있는 범위입니다.
+- 구현 계획 작성 중 D1 반영(2026-10-15): macOS 27 SDK에 `CWInterface.interfaceState`/`CWInterfaceState`가 없음을 확인했습니다. 3.2절 WirelessMonitor, 4.2절 `wireless_sample.state`, 6.4절 1행, 7.3절, 8장 "Wi-Fi 인터페이스 꺼짐" 행을 앱 정의 상태(0 off / 1 disconnected / 2 associated)로 고쳤습니다.
